@@ -20,7 +20,39 @@ from html import escape
 from ipaddress import ip_network, ip_address
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TextIO
+
+
+LOG_BUFFER: List[Tuple[str, bool]] = []
+LOG_FILE_HANDLE: Optional[TextIO] = None
+
+
+def log_message(message: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    print(message, file=stream)
+    if LOG_FILE_HANDLE:
+        if LOG_BUFFER:
+            for buffered_message, _ in LOG_BUFFER:
+                LOG_FILE_HANDLE.write(buffered_message + "\n")
+            LOG_BUFFER.clear()
+        LOG_FILE_HANDLE.write(message + "\n")
+        LOG_FILE_HANDLE.flush()
+    else:
+        LOG_BUFFER.append((message, error))
+
+
+def initialize_run_log(directory: Path, timestamp: datetime) -> Path:
+    global LOG_FILE_HANDLE
+    if LOG_FILE_HANDLE:
+        LOG_FILE_HANDLE.close()
+    log_name = timestamp.strftime("%Y_%m_%d_%H_%M") + ".log.txt"
+    log_path = directory / log_name
+    LOG_FILE_HANDLE = log_path.open("w", encoding="utf-8")
+    for message, _ in LOG_BUFFER:
+        LOG_FILE_HANDLE.write(message + "\n")
+    LOG_BUFFER.clear()
+    LOG_FILE_HANDLE.flush()
+    return log_path
 
 
 class Ansi:
@@ -158,10 +190,11 @@ def ensure_environment_ready() -> None:
     minimum_version = (3, 9)
     if sys.version_info < minimum_version:
         required = f"{minimum_version[0]}.{minimum_version[1]}"
-        print(
-            f"ERROR: Python {required}+ is required. Detected {sys.version_info.major}.{sys.version_info.minor}."
+        log_message(
+            f"ERROR: Python {required}+ is required. Detected {sys.version_info.major}.{sys.version_info.minor}.",
+            error=True,
         )
-        print("Please upgrade Python before running this tool.")
+        log_message("Please upgrade Python before running this tool.", error=True)
         sys.exit(1)
 
     project_root = Path(__file__).resolve().parent
@@ -170,29 +203,29 @@ def ensure_environment_ready() -> None:
 
     venv_present = venv_dir.exists()
     if not venv_present:
-        print(f"WARNING: Expected virtual environment directory not found at {venv_dir}.")
-        print("You can create it with:")
-        print("  python -m venv .venv")
-        print("Then install requirements inside it:")
-        print("  python -m pip install -r requirements.txt")
+        log_message(f"WARNING: Expected virtual environment directory not found at {venv_dir}.")
+        log_message("You can create it with:")
+        log_message("  python -m venv .venv")
+        log_message("Then install requirements inside it:")
+        log_message("  python -m pip install -r requirements.txt")
 
     interpreter_path = Path(sys.executable).resolve()
     inside_expected_venv = venv_present and venv_dir.resolve() in interpreter_path.parents
     venv_active = bool(active_venv) and Path(active_venv).resolve() == venv_dir.resolve()
     if venv_present and not (venv_active or inside_expected_venv):
-        print("WARNING: Project virtual environment is not active.")
+        log_message("WARNING: Project virtual environment is not active.")
         if os.name == "nt":
-            print("Activate it before running to isolate dependencies:")
-            print("  PowerShell:  .\\.venv\\Scripts\\Activate.ps1")
-            print("  CMD:        \\.venv\\Scripts\\activate.bat")
+            log_message("Activate it before running to isolate dependencies:")
+            log_message("  PowerShell:  .\\.venv\\Scripts\\Activate.ps1")
+            log_message("  CMD:        \\.venv\\Scripts\\activate.bat")
         else:
-            print("Activate it before running to isolate dependencies:")
-            print("  source .venv/bin/activate")
-        print("Continuing with the current interpreter; ensure required packages are installed.")
+            log_message("Activate it before running to isolate dependencies:")
+            log_message("  source .venv/bin/activate")
+        log_message("Continuing with the current interpreter; ensure required packages are installed.")
 
     requirements_path = project_root / "requirements.txt"
     if not requirements_path.exists():
-        print("WARNING: requirements.txt is missing. Create it (even if empty) so deployments know the dependencies.")
+        log_message("WARNING: requirements.txt is missing. Create it (even if empty) so deployments know the dependencies.")
         return
 
     missing_packages: List[str] = []
@@ -209,12 +242,12 @@ def ensure_environment_ready() -> None:
                 missing_packages.append(package_name)
 
     if missing_packages:
-        print("WARNING: Missing packages detected in the current environment:")
+        log_message("WARNING: Missing packages detected in the current environment:")
         for package in missing_packages:
-            print(f"  - {package}")
-        print("Install them inside the virtual environment with:")
-        print("  python -m pip install -r requirements.txt")
-        print("Continuing execution; missing packages may cause runtime errors if referenced.")
+            log_message(f"  - {package}")
+        log_message("Install them inside the virtual environment with:")
+        log_message("  python -m pip install -r requirements.txt")
+        log_message("Continuing execution; missing packages may cause runtime errors if referenced.")
 
 
 STRONG_CIPHERS = {
@@ -827,7 +860,7 @@ def collect_targets(args: argparse.Namespace, default_port: int) -> List[Tuple[s
             if target[0] and target not in seen:
                 targets.append(target)
                 seen.add(target)
-    if targets:
+    if targets and getattr(args, "randomize_order", True):
         random.SystemRandom().shuffle(targets)
     return targets
 
@@ -907,6 +940,84 @@ def classify_version(banner: str) -> str:
     if banner.startswith("SSH-2.") or banner.startswith("SSH-2"):
         return "SSH v2"
     return "Version not recognized"
+
+
+def infer_platform_insight(banner: str) -> str:
+    lower = banner.lower()
+    parts: List[str] = []
+
+    manufacturer_map = {
+        "cisco": "Manufacturer: Cisco",
+        "fortinet": "Manufacturer: Fortinet",
+        "fortigate": "Manufacturer: Fortinet",
+        "juniper": "Manufacturer: Juniper Networks",
+        "palo alto": "Manufacturer: Palo Alto Networks",
+        "pan-os": "Manufacturer: Palo Alto Networks",
+        "checkpoint": "Manufacturer: Check Point",
+        "sonicwall": "Manufacturer: SonicWall",
+        "f5": "Manufacturer: F5 Networks",
+        "big-ip": "Manufacturer: F5 Networks",
+        "mikrotik": "Manufacturer: MikroTik",
+        "huawei": "Manufacturer: Huawei",
+        "aruba": "Manufacturer: Aruba Networks",
+    }
+    for keyword, label in manufacturer_map.items():
+        if keyword in lower:
+            parts.append(label)
+            break
+
+    if "openssh" in lower:
+        match = re.search(r"OpenSSH[_-]?([0-9][0-9a-zA-Z\.p-]*)", banner, re.IGNORECASE)
+        version = match.group(1) if match else ""
+        component = f"OpenSSH {version}".strip()
+        parts.append(component if component else "OpenSSH detected")
+    if "dropbear" in lower:
+        match = re.search(r"Dropbear[_-]?SSH[_-]?([0-9][0-9a-zA-Z\.p-]*)", banner, re.IGNORECASE)
+        version = match.group(1) if match else ""
+        component = f"Dropbear SSH {version}".strip()
+        parts.append(component if component else "Dropbear SSH detected")
+    if "libssh" in lower:
+        match = re.search(r"libssh[_-]?([0-9][0-9a-zA-Z\.p-]*)", banner, re.IGNORECASE)
+        version = match.group(1) if match else ""
+        component = f"libssh {version}".strip()
+        parts.append(component if component else "libssh detected")
+
+    os_map = {
+        "ubuntu": "OS: Ubuntu",
+        "debian": "OS: Debian",
+        "centos": "OS: CentOS",
+        "redhat": "OS: Red Hat Enterprise Linux",
+        "red hat": "OS: Red Hat Enterprise Linux",
+        "rhel": "OS: Red Hat Enterprise Linux",
+        "suse": "OS: SUSE Linux",
+        "opensuse": "OS: openSUSE",
+        "fedora": "OS: Fedora",
+        "alpine": "OS: Alpine Linux",
+        "openbsd": "OS: OpenBSD",
+        "freebsd": "OS: FreeBSD",
+        "hp-ux": "OS: HP-UX",
+        "hpux": "OS: HP-UX",
+        "aix": "OS: IBM AIX",
+        "solaris": "OS: Solaris",
+        "sunos": "OS: Solaris",
+        "windows": "OS: Windows",
+        "vyatta": "OS: Vyatta",
+        "fortios": "OS: FortiOS",
+        "pan-os": "OS: PAN-OS",
+        "ios": "OS: Cisco IOS/IOS-XE",
+        "nx-os": "OS: Cisco NX-OS",
+    }
+    for keyword, label in os_map.items():
+        if keyword in lower:
+            parts.append(label)
+            break
+
+    if "linux" in lower and not any("OS:" in entry for entry in parts):
+        parts.append("OS: Linux (banner reference)")
+
+    if not parts:
+        return "Unknown"
+    return "; ".join(dict.fromkeys(parts))
 
 
 def classify_cipher(name: str) -> Tuple[int, str, str, str]:
@@ -1625,6 +1736,7 @@ def write_ranking_html(
                 "port": res.port,
                 "hostname": res.resolved_hostname,
                 "duration_seconds": res.duration_seconds,
+                "platform_insight": infer_platform_insight(res.banner),
                 "score": score,
                 "strong": strong,
                 "intermediate": intermediate,
@@ -1913,7 +2025,7 @@ def write_ranking_html(
         " each intermediate finding, and subtracts 2 points for each weak finding;"
         " hosts that do not support SSH v2 incur an additional 5 point penalty.</p>"
     )
-    lines.append("<table><tr><th>Rank</th><th>Host</th><th>Hostname</th><th>Duration (s)</th><th>Score</th><th>Strong</th><th>Intermediate</th><th>Weak</th><th>SSH v2</th><th>Banner</th></tr>")
+    lines.append("<table><tr><th>Rank</th><th>Host</th><th>Hostname</th><th>Duration (s)</th><th>Platform Insight</th><th>Score</th><th>Strong</th><th>Intermediate</th><th>Weak</th><th>SSH v2</th><th>Banner</th></tr>")
 
     for idx, entry in enumerate(ranking, start=1):
         supports = "yes" if entry["supports_ssh2"] else "no"
@@ -1925,6 +2037,8 @@ def write_ranking_html(
         lines.append(f"<td>{escape(hostname)}</td>")
         duration_value = entry.get("duration_seconds", 0.0)
         lines.append(f"<td>{duration_value:.3f}</td>")
+        platform_value = entry.get("platform_insight") or "Unknown"
+        lines.append(f"<td>{escape(platform_value)}</td>")
         lines.append(
             f"<td class=\"{score_class}\">{entry['score']}</td><td>{entry['strong']}</td>"
             f"<td>{entry['intermediate']}</td><td class=\"weak\">{entry['weak']}</td><td>{supports}</td>"
@@ -1981,10 +2095,16 @@ def write_ranking_html(
 
 
 def main() -> None:
+    global LOG_FILE_HANDLE
     ensure_environment_ready()
 
     parser = argparse.ArgumentParser(
-        description="Simple SSH banner scanner that lists algorithms/ciphers from KEXINIT."
+        description="Simple SSH banner scanner that lists algorithms/ciphers from KEXINIT.",
+        epilog=(
+            "Tip: For unattended runs, invoke this script via job runners such as 'nohup python ssh-scanner.py … &' on "
+            "Unix-like systems or 'Start-Job { python ssh-scanner.py … }' in PowerShell so the scan continues after "
+            "you disconnect."
+        ),
     )
     parser.add_argument(
         "target",
@@ -2022,6 +2142,20 @@ def main() -> None:
         default="ssh_scan_results",
         help="Directory to store per-target outputs when parallel execution is enabled.",
     )
+    random_group = parser.add_mutually_exclusive_group()
+    random_group.add_argument(
+        "--random",
+        dest="randomize_order",
+        action="store_true",
+        help="Shuffle the target list before scanning (default).",
+    )
+    random_group.add_argument(
+        "--no-random",
+        dest="randomize_order",
+        action="store_false",
+        help="Disable target randomization and scan sequentially.",
+    )
+    parser.set_defaults(randomize_order=True)
     parser.add_argument(
         "--lookup-cves",
         action="store_true",
@@ -2036,188 +2170,224 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.port <= 0 or args.port > 65535:
-        print("--port must be between 1 and 65535.")
-        sys.exit(1)
-
-    use_color = sys.stdout.isatty()
-    if not use_color:
-        Ansi.disable()
     try:
-        targets = collect_targets(args, args.port)
-    except ValueError as exc:
-        print(exc)
-        sys.exit(1)
+        if args.port <= 0 or args.port > 65535:
+            log_message("--port must be between 1 and 65535.", error=True)
+            sys.exit(1)
 
-    if not targets:
-        print("No targets provided.")
-        sys.exit(1)
-
-    if args.parallel_workers < 1:
-        print("--parallel-workers must be >= 1.")
-        sys.exit(1)
-
-    overall_start = datetime.now()
-    command_parts = sys.argv[:] if sys.argv else ["ssh-scanner.py"]
-    if command_parts:
-        command_parts[0] = Path(command_parts[0]).name
-    formatted_command = " ".join(command_parts)
-    run_suffix = overall_start.strftime("%Y_%m_%d_%H_%M_%S")
-
-    if args.parallel_workers == 1:
-        output_dir = Path(args.parallel_output_dir) / run_suffix
-        output_dir.mkdir(parents=True, exist_ok=True)
-        collected_results: List[ScanResult] = []
-        progress = ProgressIndicator(total=len(targets))
-        progress.start()
-
+        use_color = sys.stdout.isatty()
+        if not use_color:
+            Ansi.disable()
         try:
-            for host, port in targets:
+            targets = collect_targets(args, args.port)
+        except ValueError as exc:
+            log_message(str(exc), error=True)
+            sys.exit(1)
+
+        if not targets:
+            log_message("No targets provided.", error=True)
+            sys.exit(1)
+
+        if args.parallel_workers < 1:
+            log_message("--parallel-workers must be >= 1.", error=True)
+            sys.exit(1)
+
+        overall_start = datetime.now()
+        command_parts = sys.argv[:] if sys.argv else ["ssh-scanner.py"]
+        if command_parts:
+            command_parts[0] = Path(command_parts[0]).name
+        formatted_command = " ".join(command_parts)
+        run_suffix = overall_start.strftime("%Y_%m_%d_%H_%M_%S")
+
+        if args.parallel_workers == 1:
+            output_dir = Path(args.parallel_output_dir) / run_suffix
+            output_dir.mkdir(parents=True, exist_ok=True)
+            log_path = initialize_run_log(output_dir, overall_start)
+            log_message(f"Execution log will be saved to {log_path.name}")
+            collected_results: List[ScanResult] = []
+            progress = ProgressIndicator(total=len(targets))
+            progress.start()
+
+            try:
+                for host, port in targets:
+                    progress.task_started()
+                    log_message(f"\n===== {host}:{port} =====")
+                    host_start = datetime.now()
+                    log_message(
+                        f"Scan started at {host_start.isoformat(timespec='seconds')} for {host}:{port}"
+                    )
+                    scan_failed = False
+                    try:
+                        result = scan_target(
+                            host,
+                            port,
+                            args.timeout,
+                            lookup_cves=args.lookup_cves,
+                            max_cves=max(0, args.max_cve_results),
+                            resolve_hostname=True,
+                        )
+                    except (socket.error, RuntimeError) as exc:
+                        log_message(f"Failed to probe {host}:{port} -> {exc}", error=True)
+                        scan_failed = True
+                    else:
+                        collected_results.append(result)
+                        log_message(format_scan_result(result, use_color=use_color))
+
+                        base_name = sanitize_filename(host, port)
+                        text_path = output_dir / f"{base_name}.txt"
+                        json_path = output_dir / f"{base_name}.json"
+                        html_path = output_dir / f"{base_name}.html"
+                        csv_path = output_dir / f"{base_name}.csv"
+
+                        write_text_result(result, text_path)
+                        write_json_result(result, json_path)
+                        write_html_result(result, html_path)
+                        write_csv_result(result, csv_path)
+
+                        log_message(
+                            "Saved results for {host}:{port} -> {txt}, {js}, {ht}, {csv}".format(
+                                host=host,
+                                port=port,
+                                txt=text_path.name,
+                                js=json_path.name,
+                                ht=html_path.name,
+                                csv=csv_path.name,
+                            )
+                        )
+                    finally:
+                        host_end = datetime.now()
+                        duration = (host_end - host_start).total_seconds()
+                        status = "FAILED" if scan_failed else "completed"
+                        log_message(
+                            f"Scan finished at {host_end.isoformat(timespec='seconds')} for {host}:{port}"
+                            f" (status: {status}, duration: {duration:.2f}s)"
+                        )
+                        progress.task_finished()
+            finally:
+                progress.stop()
+
+            if collected_results:
+                overall_end = datetime.now()
+                total_duration_seconds = sum(result.duration_seconds for result in collected_results)
+                average_duration_seconds = (
+                    total_duration_seconds / len(collected_results) if collected_results else 0.0
+                )
+                run_metadata = {
+                    "command": formatted_command,
+                    "start_time": overall_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end_time": overall_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_duration_seconds": (overall_end - overall_start).total_seconds(),
+                    "average_seconds": average_duration_seconds,
+                    "host_count": len(collected_results),
+                }
+                suffix = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+                ranking_path = output_dir / f"summary_ranking_{suffix}.html"
+                write_ranking_html(collected_results, ranking_path, run_metadata)
+                log_message(f"Wrote ranking summary to {ranking_path.name}")
+        else:
+            output_dir = Path(args.parallel_output_dir) / run_suffix
+            output_dir.mkdir(parents=True, exist_ok=True)
+            log_path = initialize_run_log(output_dir, overall_start)
+            log_message(
+                f"Parallel execution enabled with {args.parallel_workers} workers; writing outputs to {output_dir.resolve()}"
+            )
+            log_message(f"Execution log will be saved to {log_path.name}")
+
+            progress = ProgressIndicator(total=len(targets))
+            progress.start()
+
+            def task(target_host: str, target_port: int) -> ScanResult:
                 progress.task_started()
-                print(f"\n===== {host}:{port} =====")
+                task_start = datetime.now()
+                log_message(
+                    f"Scan started at {task_start.isoformat(timespec='seconds')} for {target_host}:{target_port}"
+                )
+                succeeded = False
                 try:
                     result = scan_target(
-                        host,
-                        port,
+                        target_host,
+                        target_port,
                         args.timeout,
                         lookup_cves=args.lookup_cves,
                         max_cves=max(0, args.max_cve_results),
                         resolve_hostname=True,
                     )
-                except (socket.error, RuntimeError) as exc:
-                    print(f"Failed to probe {host}:{port} -> {exc}")
-                else:
-                    collected_results.append(result)
-                    print(format_scan_result(result, use_color=use_color))
-
-                    base_name = sanitize_filename(host, port)
-                    text_path = output_dir / f"{base_name}.txt"
-                    json_path = output_dir / f"{base_name}.json"
-                    html_path = output_dir / f"{base_name}.html"
-                    csv_path = output_dir / f"{base_name}.csv"
-
-                    write_text_result(result, text_path)
-                    write_json_result(result, json_path)
-                    write_html_result(result, html_path)
-                    write_csv_result(result, csv_path)
-
-                    print(
-                        "Saved results for {host}:{port} -> {txt}, {js}, {ht}, {csv}".format(
-                            host=host,
-                            port=port,
-                            txt=text_path.name,
-                            js=json_path.name,
-                            ht=html_path.name,
-                            csv=csv_path.name,
-                        )
-                    )
+                    succeeded = True
+                    return result
                 finally:
-                    progress.task_finished()
-        finally:
-            progress.stop()
-
-        if collected_results:
-            overall_end = datetime.now()
-            total_duration_seconds = sum(result.duration_seconds for result in collected_results)
-            average_duration_seconds = (
-                total_duration_seconds / len(collected_results) if collected_results else 0.0
-            )
-            run_metadata = {
-                "command": formatted_command,
-                "start_time": overall_start.strftime("%Y-%m-%d %H:%M:%S"),
-                "end_time": overall_end.strftime("%Y-%m-%d %H:%M:%S"),
-                "total_duration_seconds": (overall_end - overall_start).total_seconds(),
-                "average_seconds": average_duration_seconds,
-                "host_count": len(collected_results),
-            }
-            suffix = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-            ranking_path = output_dir / f"summary_ranking_{suffix}.html"
-            write_ranking_html(collected_results, ranking_path, run_metadata)
-            print(f"Wrote ranking summary to {ranking_path.name}")
-    else:
-        output_dir = Path(args.parallel_output_dir) / run_suffix
-        output_dir.mkdir(parents=True, exist_ok=True)
-        print(
-            f"Parallel execution enabled with {args.parallel_workers} workers; writing outputs to {output_dir.resolve()}"
-        )
-
-        progress = ProgressIndicator(total=len(targets))
-        progress.start()
-
-        def task(target_host: str, target_port: int) -> ScanResult:
-            progress.task_started()
-            try:
-                return scan_target(
-                    target_host,
-                    target_port,
-                    args.timeout,
-                    lookup_cves=args.lookup_cves,
-                    max_cves=max(0, args.max_cve_results),
-                    resolve_hostname=True,
-                )
-            finally:
-                progress.task_finished()
-
-        collected_results: List[ScanResult] = []
-
-        try:
-            with ThreadPoolExecutor(max_workers=args.parallel_workers) as executor:
-                futures = {
-                    executor.submit(task, host, port): (host, port)
-                    for host, port in targets
-                }
-
-                for future in as_completed(futures):
-                    host, port = futures[future]
-                    try:
-                        result = future.result()
-                    except (socket.error, RuntimeError) as exc:
-                        print(f"Failed to probe {host}:{port} -> {exc}")
-                        continue
-
-                    collected_results.append(result)
-                    base_name = sanitize_filename(host, port)
-                    text_path = output_dir / f"{base_name}.txt"
-                    json_path = output_dir / f"{base_name}.json"
-                    html_path = output_dir / f"{base_name}.html"
-                    csv_path = output_dir / f"{base_name}.csv"
-
-                    write_text_result(result, text_path)
-                    write_json_result(result, json_path)
-                    write_html_result(result, html_path)
-                    write_csv_result(result, csv_path)
-
-                    print(
-                        "Saved results for {host}:{port} -> {txt}, {js}, {ht}, {csv}".format(
-                            host=host,
-                            port=port,
-                            txt=text_path.name,
-                            js=json_path.name,
-                            ht=html_path.name,
-                            csv=csv_path.name,
-                        )
+                    task_end = datetime.now()
+                    duration = (task_end - task_start).total_seconds()
+                    status = "FAILED" if not succeeded else "completed"
+                    log_message(
+                        f"Scan finished at {task_end.isoformat(timespec='seconds')} for {target_host}:{target_port}"
+                        f" (status: {status}, duration: {duration:.2f}s)"
                     )
-        finally:
-            progress.stop()
+                    progress.task_finished()
 
-        if collected_results:
-            overall_end = datetime.now()
-            total_duration_seconds = sum(result.duration_seconds for result in collected_results)
-            average_duration_seconds = (
-                total_duration_seconds / len(collected_results) if collected_results else 0.0
-            )
-            run_metadata = {
-                "command": formatted_command,
-                "start_time": overall_start.strftime("%Y-%m-%d %H:%M:%S"),
-                "end_time": overall_end.strftime("%Y-%m-%d %H:%M:%S"),
-                "total_duration_seconds": (overall_end - overall_start).total_seconds(),
-                "average_seconds": average_duration_seconds,
-                "host_count": len(collected_results),
-            }
-            suffix = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-            ranking_path = output_dir / f"summary_ranking_{suffix}.html"
-            write_ranking_html(collected_results, ranking_path, run_metadata)
-            print(f"Wrote ranking summary to {ranking_path.name}")
+            collected_results: List[ScanResult] = []
+
+            try:
+                with ThreadPoolExecutor(max_workers=args.parallel_workers) as executor:
+                    futures = {
+                        executor.submit(task, host, port): (host, port)
+                        for host, port in targets
+                    }
+
+                    for future in as_completed(futures):
+                        host, port = futures[future]
+                        try:
+                            result = future.result()
+                        except (socket.error, RuntimeError) as exc:
+                            log_message(f"Failed to probe {host}:{port} -> {exc}", error=True)
+                            continue
+
+                        collected_results.append(result)
+                        base_name = sanitize_filename(host, port)
+                        text_path = output_dir / f"{base_name}.txt"
+                        json_path = output_dir / f"{base_name}.json"
+                        html_path = output_dir / f"{base_name}.html"
+                        csv_path = output_dir / f"{base_name}.csv"
+
+                        write_text_result(result, text_path)
+                        write_json_result(result, json_path)
+                        write_html_result(result, html_path)
+                        write_csv_result(result, csv_path)
+
+                        log_message(
+                            "Saved results for {host}:{port} -> {txt}, {js}, {ht}, {csv}".format(
+                                host=host,
+                                port=port,
+                                txt=text_path.name,
+                                js=json_path.name,
+                                ht=html_path.name,
+                                csv=csv_path.name,
+                            )
+                        )
+            finally:
+                progress.stop()
+
+            if collected_results:
+                overall_end = datetime.now()
+                total_duration_seconds = sum(result.duration_seconds for result in collected_results)
+                average_duration_seconds = (
+                    total_duration_seconds / len(collected_results) if collected_results else 0.0
+                )
+                run_metadata = {
+                    "command": formatted_command,
+                    "start_time": overall_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end_time": overall_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_duration_seconds": (overall_end - overall_start).total_seconds(),
+                    "average_seconds": average_duration_seconds,
+                    "host_count": len(collected_results),
+                }
+                suffix = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+                ranking_path = output_dir / f"summary_ranking_{suffix}.html"
+                write_ranking_html(collected_results, ranking_path, run_metadata)
+                log_message(f"Wrote ranking summary to {ranking_path.name}")
+    finally:
+        if LOG_FILE_HANDLE:
+            LOG_FILE_HANDLE.close()
+            LOG_FILE_HANDLE = None
 
 
 if __name__ == "__main__":
